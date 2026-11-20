@@ -1,3 +1,5 @@
+> **Fork note (strata-small-gpu):** this copy adds full Unsloth Qwen3.6 pack support and an opt-in int8 KV cache for 4 GB GPUs — see [FORK.md](FORK.md).
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="app/host/public/brand/strata-lockup-dark.svg">
