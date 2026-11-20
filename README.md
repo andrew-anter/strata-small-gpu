@@ -54,10 +54,14 @@ staging, so small cards get the right "tokens fit here" figure.
 Builds on the compact staging of §4: one kernel per layer (`k_gather_routed`)
 pulls the routed experts from the host-mapped arena in a single launch (one
 block per expert, uint4 lanes) instead of ~150 separate `cudaMemcpyAsync`
-calls, and layer l+1's gather runs on the copy stream **under layer l's expert
-compute** (the router runs early, right after the mixer's post-norm). The
-buffer pair carries no MMQ tail (the i8 kernels read only `L.bytes` per slot).
-Over-capacity layers take the CPU pool with every entry forced to it.
+calls; the router runs early (right after the mixer's post-norm). The buffer
+pair carries no MMQ tail (the i8 kernels read only `L.bytes` per slot).
+A chunk whose routed experts exceed `STRATA_Q36_ROUTE_CAP` runs them in
+cap-sized **waves** (`k_remap_groups_wave`, subset group ranges), gathering
+wave k+1 under wave k's compute. **shortcut: the multi-wave remap is not yet
+verified correct (it mislabels later waves' slots), so >1 wave currently falls
+back to the CPU pool; only single-wave chunks use the GPU gather. Upgrade when
+the multi-wave slot mapping is fixed.** Single-wave chunks are the fast path.
 
 ### 6. Opt-in windowed fp16 KV copy — `STRATA_Q36_KV_WINDOW=N`
 The prompt attention's fp16 K/V operand copy (`k16`/`v16`) normally spans the
@@ -74,18 +78,24 @@ Qwen3.6-35B-A3B UD-IQ3_XXS (13.2 GB pack), experts on CPU, dense weights on GPU:
 | | upstream path | this fork |
 |---|---|---|
 | pack loads | refused (format gates) | yes, plain + MTP |
-| decode | — | ~30.7 tok/s |
-| max context | 7,168 (fp32 KV) | **32,768** (int8 KV + small scores buffer); **16,384 at full prefill speed** (gather + KV window) |
-| prefill (1500-token prompt) | ~45 tok/s | **~78 tok/s** (gather, ≤16,384 ctx); ~65 tok/s at 32,768 ctx |
-| long-context quality | — | needle correct at 10,941 tokens; gather + windowed attention needle correct at 5,450 tokens (cross-window) via the OpenAI API |
+| decode | — | ~30 tok/s cold/empty ctx; ~22 tok/s warm (95°C, 3.5 GHz) in a real session |
+| max context | 7,168 (fp32 KV) | **32,768** (int8 KV + small scores buffer + KV window) |
+| prefill, REAL text (1500 tok) | ~45 tok/s | **~57 tok/s** (gather, 16,384 ctx, chunk 256); ~50 at chunk 512 |
+| long-context quality | — | needle correct at 10,941 and 5,450 tokens (cross-window) via the OpenAI API |
+
+Note: an earlier "~78 tok/s" figure was measured on a repeated-identical-token
+prompt, whose routing concentrates on few experts and never overflows the
+staging; it is NOT representative of real text. Real-text prefill is ~57.
 
 Honest limits on this hardware:
 
 - **Prefill without the routed paths stays slow (~45 tok/s):** the whole-layer
-  weight stream dominates. Gather reaches ~78 tok/s while the compact staging
-  fits (≤16,384 context with the KV window on this card). At 32,768 the staging
-  holds only ~64 experts, so over-capacity layers overflow to the CPU pool
-  (~65 tok/s); a split-batch gather is the next target.
+  weight stream dominates. Gather reaches ~57 tok/s on real text at 16,384 ctx
+  (chunk 256, single-wave). Chunks needing >1 wave fall back to the CPU pool
+  until the multi-wave remap is fixed; fixing it would lift chunk-512 real
+  prefill toward ~70.
+- **Decode is CPU-bound and thermally limited:** ~30 tok/s cold, ~22 warm on
+  this laptop (95°C, clocks 3.5 of 4.4 GHz). Not a software regression.
 - **MTP drafting gives no speedup on 4 GB** (CPU-bound experts; draft overhead
   cancels the gain) and costs ~2K context. The plain pack is the better deal here;
   MTP support matters on bigger cards.
@@ -107,12 +117,12 @@ Tested with CUDA 13.4 / gcc 16 on Arch Linux. Other cards: set
 
 ```sh
 # recommended on this card: int8 KV + small scores buffer + routed-gather + KV window
-# (16,384 context at ~78 tok/s prefill; cap 176 leaves staging headroom)
+# (16,384 context, chunk 256 = single-wave gather, ~57 tok/s real-text prefill)
 STRATA_Q36_KV_Q8=1 STRATA_Q36_SMALL_ATT=1 STRATA_Q36_ROUTE_GATHER=1 STRATA_Q36_ROUTE_CAP=176 STRATA_Q36_KV_WINDOW=4096 \
   ./build-sm75/strata --serve \
-  --model Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf --max-context 16384 --batch 1 --chunk 512
+  --model Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf --max-context 16384 --batch 1 --chunk 256
 
-# full 32K context: the staging holds ~64 experts, over-capacity layers on the CPU pool (~65 tok/s prefill)
+# full 32K context: staging fits only ~64 experts, so every chunk is multi-wave -> CPU pool (~45 tok/s). Length over speed.
 STRATA_Q36_KV_Q8=1 STRATA_Q36_SMALL_ATT=1 STRATA_Q36_ROUTE_GATHER=1 STRATA_Q36_ROUTE_CAP=64 STRATA_Q36_KV_WINDOW=4096 \
   ./build-sm75/strata --serve \
   --model Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf --max-context 32768 --batch 1 --chunk 256

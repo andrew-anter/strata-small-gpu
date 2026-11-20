@@ -630,6 +630,14 @@ __global__ void k_remap_groups(unsigned long long* grp_ptr, int32_t n_groups, co
     if (g >= n_groups) return;
     grp_ptr[g] = (unsigned long long) (stage + (size_t) g * stride);
 }
+/// Split-batch gather: remap only the groups of one wave [g_off, g_off + cnt) to the compact buffer's slots 0..cnt-1.
+/// The wave's experts sit at list[g_off .. g_off+cnt), gathered into this buffer in the same ascending order.
+__global__ void k_remap_groups_wave(unsigned long long* grp_ptr, int32_t g_off, int32_t cnt, const uint8_t* stage,
+                                    unsigned long long stride) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= cnt) return;
+    grp_ptr[g_off + j] = (unsigned long long) (stage + (size_t) j * stride);
+}
 /// Routed-gather (STRATA_Q36_ROUTE_GATHER): one launch copies the chunk's routed experts from the host-mapped arena
 /// into the compact buffer — slot k takes list[k]'s blob. One block per expert, uint4 lanes; the i8 kernels read only
 /// the first `bytes` of each stride-aligned slot, so the padding between bytes and stride is never copied or read.
@@ -1447,6 +1455,8 @@ struct Engine {
     int32_t* g_list = nullptr;  // its routed-expert list, ascending (ne ints)
     int32_t* g_nr = nullptr;    // its routed count (1 int)
     int32_t* g_nr_h = nullptr;  // pinned: the count read back per layer
+    int32_t* g_wnr = nullptr;   // device: the current wave's group count (the i8 kernels read it)
+    int32_t* h_wnr = nullptr;   // pinned mirror of g_wnr
     cudaEvent_t ev_gather[2] = {};   // buffer b's gather finished
     cudaEvent_t ev_gused[2] = {};    // buffer b's last reader done
     int g_pend = -1;            // the layer whose gather is in flight (-1: none)
@@ -2429,7 +2439,8 @@ struct Engine {
         const bool g_layer = route_gather && lhy(li) && i8_on[li] && T > hybrid_t && use_pf && !cpu_prompt && !verify_k;
         if (g_layer) {
             gather_route(L, li, T);
-            gather_kick_next();
+            g_pend = (int) li;
+            gather_kick_wave((int) li, 0);
         }
         // routed experts (one token: the router and the shared expert's gate in one product, the gate its last row)
         const bool one = T == 1;
@@ -2494,12 +2505,14 @@ struct Engine {
             // step for the fused/MMQ layers either way.
             const bool zc_i8 = zc_arena && i8_on[li] && lhy(li) && !route_gather;
             const bool rs_i8 = route_stream && !route_gather && i8_on[li] && lhy(li) && !zc_i8;
-            const uint8_t* wbase = g_layer ? gather_take((int) li)
+            const uint8_t* wbase = g_layer ? stage[0]
                                            : (zc_i8 ? L.hblobs : (rs_i8 ? stream_take_routed(L, (int) li, T)
                                                                       : (lhy(li) ? stream_take((int) li) : L.blobs)));
-            // a chunk that routes more experts than the compact buffer holds: no staging copy is possible; the
-            // layer's entries go to the CPU pool straight from host memory (correct, slower) instead
-            const bool rs_cpu = g_layer ? (wbase == nullptr) : (rs_i8 && *h_routed > route_cap);
+            // a chunk that routes more experts than the compact buffer holds: the streamed path falls back to the CPU
+            // pool; the gather path instead runs cap-sized waves (below), so it never overflows
+            // safety: the split-batch wave path is only trusted for a single wave (nr <= cap); a chunk needing more
+            // waves falls back to the CPU pool (correct) until the multi-wave remap is verified
+            const bool rs_cpu = g_layer ? (g_nr_h[li] > route_cap) : (rs_i8 && *h_routed > route_cap);
             if (rs_cpu) {
                 CK(cudaMemsetAsync(eparts, 0, (size_t) n_ent * N * 4, st));
                 CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
@@ -2520,11 +2533,36 @@ struct Engine {
                     FQ::experts_native_ext(b, ng, ne, n_ent, f_scr, f_xq, f_src, f_ha, eparts, st);
                 }
                 prow = f_slot;
+            } else if (g_layer) {
+                // split-batch gather: the routed experts run in cap-sized waves; wave w+1's gather overlaps wave w's
+                // compute, so a chunk may route more experts than one buffer holds without touching the CPU pool.
+                const int nr = g_nr_h[li];
+                const int nwaves = (nr + route_cap - 1) / route_cap;
+                const bool few = K::q36_i8_chunk_takes(n_ent, ne, i8_few);
+                if (few) K::native_expert_i8_quantize(h, T, N, i8x, st);
+                else if (!xq_post) quant(h, N, T, xq);
+                group_entries(L, nullptr, T, stage[0]);   // all groups ascending; blob pointers remapped per wave
+                for (int w = 0; w < nwaves; ++w) {
+                    const int b = w % 2;
+                    const int cnt = std::min(route_cap, nr - w * route_cap);
+                    CK(cudaStreamWaitEvent(st, ev_gather[b], 0));
+                    if (w + 1 < nwaves) gather_kick_wave((int) li, w + 1);
+                    k_remap_groups_wave<<<grid1(cnt), kThreads, 0, st>>>(grp_ptr, w * route_cap, cnt, stage[b], L.stride);
+                    *h_wnr = cnt;
+                    CK(cudaMemcpyAsync(g_wnr, h_wnr, 4, cudaMemcpyHostToDevice, st));
+                    const unsigned long long* gp = grp_ptr + (size_t) w * route_cap;
+                    const int32_t* gs = grp_start + (size_t) w * route_cap;
+                    if (few)
+                        K::native_expert_i8(L.L, gp, gs, g_wnr, ent_dst, ent_tok, std::min<int64_t>(n_ent, g.n_expert), n_ent, i8x, escr, eparts, st);
+                    else
+                        K::native_expert_grouped(L.L, gp, gs, g_wnr, ent_dst, ent_tok, std::min<int64_t>(n_ent, g.n_expert), n_ent, xq, escr, eparts, st);
+                    CK(cudaEventRecord(ev_gused[b], st));
+                }
             } else if (i8l) {
                 // our int8 expert kernels: the layer's rows quantized once, the groups per expert (blobs from wbase: the streamed ring in the hybrid mode), gate/up + SwiGLU + H to int8 and
                 // the down rows into eparts by entry (prow stays null, as the grouped kernels).  A chunk whose experts average few rows takes the grouped kernels (the few-rows route).
                 group_entries(L, nullptr, T, wbase);
-                if ((rs_i8 && *h_routed <= route_cap) || (g_layer && wbase != nullptr)) {   // compact staging: group g's expert is at slot g, not expert*g
+                if (rs_i8 && *h_routed <= route_cap) {   // compact staging: group g's expert is at slot g, not expert*g
                     int32_t ng_h = 0;
                     CK(cudaMemcpyAsync(&ng_h, n_groups, 4, cudaMemcpyDeviceToHost, st));
                     CK(cudaStreamSynchronize(st));
@@ -2702,40 +2740,25 @@ struct Engine {
         CK(cudaStreamSynchronize(st));
         for (int x = 0; x < ne; ++x) hy[li].score[(size_t) x] += h_cnt[li * g.n_expert + x];
     }
-    /// Kick the gather of g_seq[g_pos] into buffer g_pos % 2 on the copy stream (after the buffer's last reader).
-    void gather_kick_next() {
-        if (g_pos >= (int) g_seq.size()) return;
-        const int li = g_seq[(size_t) g_pos];
-        const int b = g_pos % 2;
-        const Layer& L = layer_at(li);
+    /// Split-batch gather: kick wave w of layer li — experts [w*cap, w*cap+cnt) of its routed list — into buffer w%2
+    /// on the copy stream, after that buffer's last reader. Waves let a chunk route more experts than one buffer holds
+    /// (no CPU overflow), and wave w+1's gather runs under wave w's compute.
+    void gather_kick_wave(int li, int w) {
         const int ne = (int) m->g.n_expert;
         const int nr = g_nr_h[li];
-        if (nr > route_cap) {   // over capacity: no gather; the layer's MoE takes the CPU pool
-            g_pend = li;
-            ++g_pos;
-            return;
-        }
+        const int cnt = std::min(route_cap, nr - w * route_cap);
+        if (cnt <= 0) return;
+        const int b = w % 2;
+        const Layer& L = layer_at(li);
         CK(cudaStreamWaitEvent(cst, ev_gused[b], 0));
-        k_gather_routed<<<nr, kThreads, 0, cst>>>(L.hblobs, L.stride, g_list + (size_t) li * ne, nr, L.L.bytes, stage[b]);
+        k_gather_routed<<<cnt, kThreads, 0, cst>>>(L.hblobs, L.stride,
+                                                  g_list + (size_t) li * ne + (size_t) w * route_cap, cnt, L.L.bytes,
+                                                  stage[b]);
         CK(cudaEventRecord(ev_gather[b], cst));
-        g_pend = li;
-        ++g_pos;
     }
-    /// The MoE of layer li: wait for its gather (if any), return the compact buffer (null: over capacity -> CPU pool).
-    const uint8_t* gather_take(int li) {
-        if (g_pend != li) {
-            std::fprintf(stderr, "strata-q36: the expert gather is out of step (layer %d, pending %d)\n", li, g_pend);
-            std::exit(1);
-        }
-        if (g_nr_h[li] > route_cap) return nullptr;
-        const int b = (g_pos - 1) % 2;
-        CK(cudaStreamWaitEvent(st, ev_gather[b], 0));
-        return stage[b];
-    }
-    /// After layer li's expert kernels: mark its buffer free (the next gather of that buffer waits on this event).
+    /// After layer li's wave kernels: release the pending marker (each wave records its own ev_gused in the MoE loop).
     void gather_done(int li) {
-        const int b = (g_pos - 1) % 2;
-        CK(cudaEventRecord(ev_gused[b], st));
+        (void) li;
         g_pend = -1;
     }
     /// A streamed forward over the state indices `seq`: the first two layers' experts start copying now.
@@ -3683,6 +3706,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         E.g_list = dalloc_t<int32_t>(all.size() * (size_t) ne);
         E.g_nr = dalloc_t<int32_t>(all.size());
         CK(cudaHostAlloc((void**) &E.g_nr_h, all.size() * sizeof(int32_t), cudaHostAllocDefault));
+        E.g_wnr = dalloc_t<int32_t>(1);
+        CK(cudaHostAlloc((void**) &E.h_wnr, sizeof(int32_t), cudaHostAllocDefault));
     }
     E.pool = std::make_unique<C::ExpertPool>(threads);
     CK(cudaDeviceSynchronize());
