@@ -1506,6 +1506,11 @@ struct Engine {
             std::fprintf(stderr, "strata-q36: cuBLAS handle failed\n");
             std::exit(1);
         }
+        // STRATA_Q36_SMALL_ATT=1: the prompt scores buffer at 64 MB instead of 256 MB from the start (the
+        // same size shrink_att() uses when experts nearly fit). Long prompts take more, smaller slices;
+        // frees ~192 MB of VRAM for the KV cache on small cards. Opt-in; default path unchanged.
+        if (std::getenv("STRATA_Q36_SMALL_ATT") != nullptr && std::getenv("STRATA_Q36_SMALL_ATT")[0] != '0')
+            kAttScoreFloats = (size_t) 16 << 20;
         att_s = dalloc(kAttScoreFloats);
         sk_part = dalloc((size_t) kSplitK * T * (g.n_expert + 1));
         att_p16 = dalloc_t<__half>(kAttScoreFloats);
