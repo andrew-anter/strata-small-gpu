@@ -520,6 +520,46 @@ __global__ void k_kv_f16(const float* kc, const float* vc, __half* k16, __half* 
         v16[i] = __float2half(vc[src]);
     }
 }
+/// The windowed fp16 K/V fill (STRATA_Q36_KV_WINDOW): cells [c0, c0 + n) of the context into the window buffer
+/// ([kvh][n][HD] halves). grid1(HKV * n * HD).
+__global__ void k_kv_f16_win(const float* kc, const float* vc, __half* k16, __half* v16, int ctx, int c0, int n,
+                             int HD, int HKV, const int8_t* kq8, const int8_t* vq8, const uint16_t* ks8,
+                             const uint16_t* vs8) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t) HKV * n * HD) return;
+    const int64_t per = (int64_t) n * HD;
+    const int64_t kvh = i / per, rest = i % per;
+    const int64_t pos = c0 + rest / HD, dim = rest % HD;
+    if (kq8) {
+        const size_t cell = (size_t) kvh * ctx + pos;
+        const int g = (int) (dim / kKvQ8Group);
+        const float ks_f = strata::kernels::f32_from_f16(ks8[cell * (HD / kKvQ8Group) + g]);
+        const float vs_f = strata::kernels::f32_from_f16(vs8[cell * (HD / kKvQ8Group) + g]);
+        k16[i] = __float2half((float) kq8[cell * HD + dim] * ks_f);
+        v16[i] = __float2half((float) vq8[cell * HD + dim] * vs_f);
+    } else {
+        const size_t src = (size_t) kvh * ctx * HD + pos * HD + dim;
+        k16[i] = __float2half(kc[src]);
+        v16[i] = __float2half(vc[src]);
+    }
+}
+/// The windowed causal softmax: row (h, t) of S (ld floats, w cells of [c0, c0 + w)) -> softmax over the cells
+/// [c0, min(c0 + w, pos0 + t + 1)), 0 past them, as FP16 probabilities. grid (T, H), block 256.
+__global__ void k_attn_softmax16_win(const float* S, __half* S16, int ld, int T, int w, int c0, int pos0, float scale) {
+    __shared__ float sh[kThreads];
+    const int t = blockIdx.x, h = blockIdx.y;
+    const float* row = S + ((size_t) h * T + t) * ld;
+    __half* out = S16 + ((size_t) h * T + t) * ld;
+    const int n = min(w, pos0 + t + 1 - c0);   // <= 0: the whole window is past this query's cells
+    float mx = -INFINITY;
+    for (int p = threadIdx.x; p < n; p += blockDim.x) mx = fmaxf(mx, row[p] * scale);
+    mx = block_max(mx, sh);
+    float sum = 0.f;
+    for (int p = threadIdx.x; p < n; p += blockDim.x) sum += expf(row[p] * scale - mx);
+    sum = block_sum(sum, sh);
+    const float inv = sum > 0.f ? 1.0f / sum : 0.f;
+    for (int p = threadIdx.x; p < w; p += blockDim.x) out[p] = __float2half(p < n ? expf(row[p] * scale - mx) * inv : 0.f);
+}
 /// The prompt's causal softmax: row (h, t) of S (ld floats, P cells) -> softmax(S * scale) over the cells
 /// [0, pos0 + t], 0 past them, as FP16 probabilities (S16, the same row offsets, ld halves).  grid (T, H), block 256.
 __global__ void k_attn_softmax16(const float* S, __half* S16, int ld, int T, int P, int pos0, float scale) {
@@ -589,6 +629,21 @@ __global__ void k_remap_groups(unsigned long long* grp_ptr, int32_t n_groups, co
     const int g = blockIdx.x * blockDim.x + threadIdx.x;
     if (g >= n_groups) return;
     grp_ptr[g] = (unsigned long long) (stage + (size_t) g * stride);
+}
+/// Routed-gather (STRATA_Q36_ROUTE_GATHER): one launch copies the chunk's routed experts from the host-mapped arena
+/// into the compact buffer — slot k takes list[k]'s blob. One block per expert, uint4 lanes; the i8 kernels read only
+/// the first `bytes` of each stride-aligned slot, so the padding between bytes and stride is never copied or read.
+__global__ void k_gather_routed(const uint8_t* __restrict__ src, unsigned long long stride,
+                                const int32_t* __restrict__ list, int n_routed, size_t bytes,
+                                uint8_t* __restrict__ dst) {
+    const int k = blockIdx.x;
+    if (k >= n_routed) return;
+    const uint4* s = reinterpret_cast<const uint4*>(src + (unsigned long long) list[k] * stride);
+    uint4* d = reinterpret_cast<uint4*>(dst + (size_t) k * stride);
+    const size_t n16 = bytes / 16;
+    for (size_t i = threadIdx.x; i < n16; i += blockDim.x) d[i] = s[i];
+    for (size_t i = n16 * 16 + threadIdx.x; i < bytes; i += blockDim.x)
+        reinterpret_cast<uint8_t*>(d)[i] = reinterpret_cast<const uint8_t*>(s)[i];
 }
 __global__ void k_route_scatter(const int32_t* ids, int n_ent, int K_, int32_t* cur, int32_t* dst, int32_t* src,
                                 int32_t* inv) {
@@ -1297,6 +1352,7 @@ struct Engine {
     float* sk_part = nullptr;          // the split-K partials of the F32 projections: [kSplitK][tmax][<= 257]
     __half* att_p16 = nullptr;         // the probabilities in FP16 (kAttScoreFloats halves)
     __half *k16 = nullptr, *v16 = nullptr, *q16 = nullptr;   // the prompt attention's FP16 operands
+    int kv_win = 0;   // STRATA_Q36_KV_WINDOW: k16/v16 hold only this many cells (0: the whole context)
     size_t kAttScoreFloats = (size_t) 64 << 20;   // 256 MB (16 M floats when the experts' fit is close)
     // the prompt's experts on Strata's fused int8 kernels (moe_fused_iq_q36.cu, CUDA): per layer (fused_on), the rest on MMQ
     // where it has a tile, else the native grouped kernels.  use_pf: every layer's prompt chunks have one of the two, so the
@@ -1385,6 +1441,17 @@ struct Engine {
     int32_t* h_routed = nullptr;   // pinned: the routed count read back per layer
     const int32_t* stream_ids = nullptr;   // routed-only streaming: the chunk's routed ids (device), set at forward start
     int stream_nent = 0;
+    bool route_gather = false;  // STRATA_Q36_ROUTE_GATHER: one kernel per layer gathers the routed experts from the
+                                // host-mapped arena into a compact buffer; layer l+1's gather overlaps layer l's MoE
+    int32_t* g_cnt = nullptr;   // route counts of the layer being gathered (ne ints)
+    int32_t* g_list = nullptr;  // its routed-expert list, ascending (ne ints)
+    int32_t* g_nr = nullptr;    // its routed count (1 int)
+    int32_t* g_nr_h = nullptr;  // pinned: the count read back per layer
+    cudaEvent_t ev_gather[2] = {};   // buffer b's gather finished
+    cudaEvent_t ev_gused[2] = {};    // buffer b's last reader done
+    int g_pend = -1;            // the layer whose gather is in flight (-1: none)
+    std::vector<int> g_seq;     // the state indices this forward gathers, in order
+    int g_pos = 0;              // the next of g_seq to gather
     // #5012: the expert placement, for the INFO line (the Monitor's "expert cache: slots / experts"; strata/qwen35/expert_info.hpp)
     strata::qwen35::ExpertInfo expert_info;
     bool mtp_graph = true;      // the MTP draft step may be a graph (not when its layer is hybrid)
@@ -1514,7 +1581,13 @@ struct Engine {
         if (cpu_prompt) std::fprintf(stderr, "strata-q36: CPU prompt experts on (STRATA_Q36_CPU_PROMPT): routed experts on the CPU pool, no weight stream\n");
         route_stream = std::getenv("STRATA_Q36_ROUTE_STREAM") != nullptr && std::getenv("STRATA_Q36_ROUTE_STREAM")[0] != '0';
         if (route_stream) std::fprintf(stderr, "strata-q36: routed-only expert streaming on (STRATA_Q36_ROUTE_STREAM): compact staging, ~4x less PCIe\n");
-        if (route_stream && cpu_prompt) {   // the two prompt paths are exclusive: routed streaming wins
+        route_gather = std::getenv("STRATA_Q36_ROUTE_GATHER") != nullptr && std::getenv("STRATA_Q36_ROUTE_GATHER")[0] != '0';
+        if (route_gather) {
+            route_stream = true;   // the compact-buffer machinery (cap, scratch, fit figures) is shared
+            std::fprintf(stderr, "strata-q36: routed-gather prefill on (STRATA_Q36_ROUTE_GATHER): one gather kernel per layer, "
+                         "double-buffered, overlapped with the next layer's attention\n");
+        }
+        if ((route_stream || route_gather) && cpu_prompt) {   // the prompt paths are exclusive: the compact staging wins
             cpu_prompt = false;
             std::fprintf(stderr, "strata-q36: STRATA_Q36_CPU_PROMPT ignored while routed-only streaming is on\n");
         }
@@ -1549,8 +1622,12 @@ struct Engine {
         att_s = dalloc(kAttScoreFloats);
         sk_part = dalloc((size_t) kSplitK * T * (g.n_expert + 1));
         att_p16 = dalloc_t<__half>(kAttScoreFloats);
-        k16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
-        v16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
+        // STRATA_Q36_KV_WINDOW=N: the fp16 K/V copy holds only N cells, refilled per attention window (the prompt
+        // GEMMs then run over windows of the context). Frees (ctx - N) x n_head_kv x head_dim x 4 bytes of VRAM.
+        if (const char* kw = std::getenv("STRATA_Q36_KV_WINDOW")) kv_win = std::max(256, std::atoi(kw));
+        const size_t kv16_cells = kv_win > 0 ? (size_t) std::min<int64_t>(kv_win, ctx) : (size_t) ctx;
+        k16 = dalloc_t<__half>((size_t) g.n_head_kv * kv16_cells * g.head_dim);
+        v16 = dalloc_t<__half>((size_t) g.n_head_kv * kv16_cells * g.head_dim);
         q16 = dalloc_t<__half>(T * g.n_head * g.head_dim);
         const bool mmq_avail = MMQ::built() && std::getenv("STRATA_Q36_NO_MMQ") == nullptr;
         auto mmq_ok = [&](const Layer& L) {
@@ -1727,7 +1804,9 @@ struct Engine {
                 std::exit(1);
             }
             if (n_sess == 1) {   // #5715: one session whose context cannot fit, said in words before the allocation fails
-                const size_t shared_tok = (size_t) g.n_head_kv * g.head_dim * 2 * 2;   // the fp16 K / V copy (k16 / v16 above)
+                // the fp16 K/V copy (k16/v16): the whole context, or kv_win cells when STRATA_Q36_KV_WINDOW is set
+                const size_t shared_cells = kv_win > 0 ? (size_t) std::min<int64_t>(kv_win, ctx) : (size_t) ctx;
+                const size_t shared_tok = (size_t) g.n_head_kv * g.head_dim * 2 * 2 * shared_cells / (size_t) ctx;
                 const size_t kv_tok = kv_tok_layer * n_attn;
                 const size_t ne = (size_t) g.n_expert;
                 size_t total_main = 0, max_layer = 0, max_stride = 0, packed = 0;
@@ -1746,11 +1825,13 @@ struct Engine {
                 if (const char* rc = std::getenv("STRATA_Q36_ROUTE_CAP")) fit_route_cap = std::max(16, std::min((int) ne, std::atoi(rc)));
                 fit_route_cap = (int) std::min<int64_t>((int64_t) ne, (int64_t) fit_route_cap);
                 const size_t fit_staging = route_stream ? max_stride * (size_t) fit_route_cap : max_layer;
+                // gather mode's buffers carry no MMQ tail (the i8 kernels read only L.bytes of each slot)
+                const size_t fit_tail = route_gather ? 0 : kMmqTail;
                 const strata::qwen35::OneSessionFit f = strata::qwen35::one_session_fit(
                     {(size_t) ctx, kv_tok, shared_tok, per - kv_tok * (size_t) ctx, fr0, total_main, packed,
                      kAttScoreFloats > ((size_t) 16 << 20) ? (kAttScoreFloats - ((size_t) 16 << 20)) * 6 : 0,
                      strata::qwen35::one_session_staging_counted(use_mmq, n_i8 > 0, use_pf, MMQ::built())
-                         ? 2 * (fit_staging + kMmqTail) : 0, T * Kp * N * 4 + T * Kp * 4});
+                         ? 2 * (fit_staging + fit_tail) : 0, T * Kp * N * 4 + T * Kp * 4});
                 if (f.refuse) {   // the old ending: the bare cudaMalloc line in alloc_session, or the hybrid buffers' text in place_experts
                     std::fprintf(stderr, "strata-q36: %s\n", strata::qwen35::one_session_fit_line(ctx, f).c_str());
                     std::exit(1);
@@ -2238,40 +2319,88 @@ struct Engine {
                 // head (its query heads one strided batch over the shared K / V), the causal softmax in between writing
                 // FP16 probabilities; the queries in slices whose scores fit
                 const int P = (int) p0 + T;
-                const int ldp = (P + 7) / 8 * 8;
-                const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) (kAttScoreFloats / ((size_t) H * ldp))));
                 const int G = H / HKV;
                 const float one = 1.0f, zero = 0.0f;
-                k_kv_f16<<<grid1((int64_t) HKV * P * HD), kThreads, 0, st>>>(kc[li], vc[li], k16, v16, ctx, P, HD, HKV,
-                                                                           kv_q8 ? kq8[li] : nullptr, kv_q8 ? vq8[li] : nullptr,
-                                                                           kv_q8 ? ks8[li] : nullptr, kv_q8 ? vs8[li] : nullptr);
                 k_to_f16<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(q, q16, (int64_t) T * H * HD);
-                for (int t0 = 0; t0 < T; t0 += tq) {
-                    const int nt = std::min(tq, T - t0);
-                    for (int kvh = 0; kvh < HKV; ++kvh) {
-                        const __half* Kh = k16 + (size_t) kvh * P * HD;
-                        const __half* Qh = q16 + ((size_t) t0 * H + kvh * G) * HD;
-                        float* Sh = att_s + (size_t) kvh * G * nt * ldp;
-                        if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, HD, &one, Kh, CUDA_R_16F, HD,
-                                                       0, Qh, CUDA_R_16F, H * HD, HD, &zero, Sh, CUDA_R_32F, ldp,
-                                                       (long long) nt * ldp, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
-                            CUBLAS_STATUS_SUCCESS) {
-                            std::fprintf(stderr, "strata-q36: attention scores GEMM failed\n");
-                            std::exit(1);
+                if (kv_win > 0 && kv_win < P) {
+                    // the fp16 K/V copy holds only kv_win cells: the scores run over windows of the context, each
+                    // window's softmax local (its probabilities sum to 1 over the window's visible cells), the value
+                    // GEMM accumulated across windows with beta = 1 after the first. Windows past a query's cells
+                    // contribute exact zeros, so the sum is the full-context attention.
+                    const int W = kv_win;
+                    const int ldw = (W + 7) / 8 * 8;
+                    const int tqw = (int) std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) (kAttScoreFloats / ((size_t) H * ldw))));
+                    for (int c0 = 0; c0 < P; c0 += W) {
+                        const int w = std::min(W, P - c0);
+                        if (c0 >= (int) p0 + T) break;   // no query sees this window (p0 + T - 1 is the last cell)
+                        k_kv_f16_win<<<grid1((int64_t) HKV * w * HD), kThreads, 0, st>>>(
+                            kc[li], vc[li], k16, v16, ctx, c0, w, HD, HKV, kv_q8 ? kq8[li] : nullptr,
+                            kv_q8 ? vq8[li] : nullptr, kv_q8 ? ks8[li] : nullptr, kv_q8 ? vs8[li] : nullptr);
+                        for (int t0 = 0; t0 < T; t0 += tqw) {
+                            const int nt = std::min(tqw, T - t0);
+                            if (c0 >= (int) p0 + t0 + nt) continue;   // the window is past every query of this slice
+                            for (int kvh = 0; kvh < HKV; ++kvh) {
+                                const __half* Kh = k16 + (size_t) kvh * w * HD;
+                                const __half* Qh = q16 + ((size_t) t0 * H + kvh * G) * HD;
+                                float* Sh = att_s + (size_t) kvh * G * nt * ldw;
+                                if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, w, nt, HD, &one, Kh, CUDA_R_16F, HD,
+                                                               0, Qh, CUDA_R_16F, H * HD, HD, &zero, Sh, CUDA_R_32F, ldw,
+                                                               (long long) nt * ldw, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
+                                    CUBLAS_STATUS_SUCCESS) {
+                                    std::fprintf(stderr, "strata-q36: attention scores GEMM failed\n");
+                                    std::exit(1);
+                                }
+                            }
+                            k_attn_softmax16_win<<<dim3(nt, H), kThreads, 0, st>>>(att_s, att_p16, ldw, nt, w, c0,
+                                                                                   (int) p0 + t0, 1.0f / sqrtf((float) HD));
+                            const float beta = c0 == 0 ? 0.0f : 1.0f;
+                            for (int kvh = 0; kvh < HKV; ++kvh) {
+                                const __half* Vh = v16 + (size_t) kvh * w * HD;
+                                const __half* Sh = att_p16 + (size_t) kvh * G * nt * ldw;
+                                float* Oh = att + ((size_t) t0 * H + kvh * G) * HD;
+                                if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, HD, nt, w, &one, Vh, CUDA_R_16F, HD,
+                                                               0, Sh, CUDA_R_16F, ldw, (long long) nt * ldw, &beta, Oh, CUDA_R_32F,
+                                                               H * HD, HD, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
+                                    CUBLAS_STATUS_SUCCESS) {
+                                    std::fprintf(stderr, "strata-q36: attention values GEMM failed\n");
+                                    std::exit(1);
+                                }
+                            }
                         }
                     }
-                    k_attn_softmax16<<<dim3(nt, H), kThreads, 0, st>>>(att_s, att_p16, ldp, nt, P, (int) p0 + t0,
-                                                                       1.0f / sqrtf((float) HD));
-                    for (int kvh = 0; kvh < HKV; ++kvh) {
-                        const __half* Vh = v16 + (size_t) kvh * P * HD;
-                        const __half* Sh = att_p16 + (size_t) kvh * G * nt * ldp;
-                        float* Oh = att + ((size_t) t0 * H + kvh * G) * HD;
-                        if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, HD, nt, P, &one, Vh, CUDA_R_16F, HD,
-                                                       0, Sh, CUDA_R_16F, ldp, (long long) nt * ldp, &zero, Oh, CUDA_R_32F,
-                                                       H * HD, HD, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
-                            CUBLAS_STATUS_SUCCESS) {
-                            std::fprintf(stderr, "strata-q36: attention values GEMM failed\n");
-                            std::exit(1);
+                } else {
+                    const int ldp = (P + 7) / 8 * 8;
+                    const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) (kAttScoreFloats / ((size_t) H * ldp))));
+                    k_kv_f16<<<grid1((int64_t) HKV * P * HD), kThreads, 0, st>>>(kc[li], vc[li], k16, v16, ctx, P, HD, HKV,
+                                                                               kv_q8 ? kq8[li] : nullptr, kv_q8 ? vq8[li] : nullptr,
+                                                                               kv_q8 ? ks8[li] : nullptr, kv_q8 ? vs8[li] : nullptr);
+                    for (int t0 = 0; t0 < T; t0 += tq) {
+                        const int nt = std::min(tq, T - t0);
+                        for (int kvh = 0; kvh < HKV; ++kvh) {
+                            const __half* Kh = k16 + (size_t) kvh * P * HD;
+                            const __half* Qh = q16 + ((size_t) t0 * H + kvh * G) * HD;
+                            float* Sh = att_s + (size_t) kvh * G * nt * ldp;
+                            if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, HD, &one, Kh, CUDA_R_16F, HD,
+                                                           0, Qh, CUDA_R_16F, H * HD, HD, &zero, Sh, CUDA_R_32F, ldp,
+                                                           (long long) nt * ldp, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
+                                CUBLAS_STATUS_SUCCESS) {
+                                std::fprintf(stderr, "strata-q36: attention scores GEMM failed\n");
+                                std::exit(1);
+                            }
+                        }
+                        k_attn_softmax16<<<dim3(nt, H), kThreads, 0, st>>>(att_s, att_p16, ldp, nt, P, (int) p0 + t0,
+                                                                           1.0f / sqrtf((float) HD));
+                        for (int kvh = 0; kvh < HKV; ++kvh) {
+                            const __half* Vh = v16 + (size_t) kvh * P * HD;
+                            const __half* Sh = att_p16 + (size_t) kvh * G * nt * ldp;
+                            float* Oh = att + ((size_t) t0 * H + kvh * G) * HD;
+                            if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, HD, nt, P, &one, Vh, CUDA_R_16F, HD,
+                                                           0, Sh, CUDA_R_16F, ldp, (long long) nt * ldp, &zero, Oh, CUDA_R_32F,
+                                                           H * HD, HD, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
+                                CUBLAS_STATUS_SUCCESS) {
+                                std::fprintf(stderr, "strata-q36: attention values GEMM failed\n");
+                                std::exit(1);
+                            }
                         }
                     }
                 }
@@ -2295,18 +2424,27 @@ struct Engine {
             mm(L.wo, att, y, T);
         }
         add_rms_post(L, T);
+        // routed-gather: the router + top-k + route list run here (before the MoE), so the next layer's gather can
+        // start under this layer's expert compute; the MoE below reuses ids/ewts and skips its own routing
+        const bool g_layer = route_gather && lhy(li) && i8_on[li] && T > hybrid_t && use_pf && !cpu_prompt && !verify_k;
+        if (g_layer) {
+            gather_route(L, li, T);
+            gather_kick_next();
+        }
         // routed experts (one token: the router and the shared expert's gate in one product, the gate its last row)
         const bool one = T == 1;
         // a decode batch of up to 8 rows takes the router and the shared expert's gate in one product too (rows of 257) when the fused
         // router follows; the prompt chunks and the checks keep the separate products
         const bool ext = one || (fast_k && std::getenv("STRATA_Q36_NO_EXT") == nullptr && !verify_k && T <= kGemmT && g.n_expert == 256 && Kp == 8);
-        if (ext) f32mm(L.router_ext, h, logits_r, N, (int) g.n_expert + 1, T);
-        else f32mm(L.router, h, logits_r, N, (int) g.n_expert, T);
+        if (!g_layer) {   // gather layers routed early (gather_route); their logits_r/ids/ewts are already set
+            if (ext) f32mm(L.router_ext, h, logits_r, N, (int) g.n_expert + 1, T);
+            else f32mm(L.router, h, logits_r, N, (int) g.n_expert, T);
+        }
         // the hybrid rows path: a batch of up to hybrid_t rows; when only the MTP block is hybrid, its every batch
         // (its prompt pass too: no staging buffers then)
         const bool hy_rows = lhy(li) && (T <= hybrid_t || !main_hybrid);
         const bool mmq_rows = !hy_rows && T > kGemmT && use_pf;
-        if (!(!mmq_rows && route_group(L, hy_rows ? hy[li].slot_of_d : nullptr, T, ext ? (int) g.n_expert + 1 : (int) g.n_expert)))
+        if (!g_layer && !(!mmq_rows && route_group(L, hy_rows ? hy[li].slot_of_d : nullptr, T, ext ? (int) g.n_expert + 1 : (int) g.n_expert)))
             K::native_router_topk(logits_r, ids, ewts, (int) g.n_expert, Kp, T, st);
         const int64_t n_ent = (int64_t) T * Kp;
         const int32_t* prow = nullptr;
@@ -2321,7 +2459,7 @@ struct Engine {
             CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
             CK(cudaMemcpyAsync(h_h, h, (size_t) T * N * 4, cudaMemcpyDeviceToHost, st));
             CK(cudaEventRecord(ev_route, st));
-            moe_hybrid_cpu(li, T);
+            moe_hybrid_cpu(li, T, true);
             if (std::getenv("STRATA_Q36_ROUTE_DEBUG") && li == 0)
                 std::fprintf(stderr, "strata-q36 CPU-PROMPT layer 0: T=%d n_ent=%lld hy_cpu=%lld hy_cpu_ms=%.0f\n", T, (long long)n_ent, hy_cpu, hy_cpu_ms);
         } else if (T > kGemmT && use_pf) {
@@ -2333,7 +2471,7 @@ struct Engine {
             const bool i8l = i8_on[li] != 0;   // our int8 kernels (no sorted-row tables: they collect their own groups)
             const bool mql = !fz && !i8l;       // MMQ
             int64_t maxr = 0;
-            if (mql || lhy(li)) {
+            if ((mql || lhy(li)) && !g_layer) {   // gather layers counted their routes early (gather_route)
                 CK(cudaMemsetAsync(rcnt, 0, (size_t) ne * 4, st));
                 k_route_count<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, rcnt);
             }
@@ -2344,8 +2482,8 @@ struct Engine {
                 k_route_scatter<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, Kp, rcur, ent_dst, ent_tok, rinv);
                 CK(cudaMemcpyAsync(hpin + 10, rmax, 4, cudaMemcpyDeviceToHost, st));
             }
-            if (lhy(li)) CK(cudaMemcpyAsync(h_cnt + li * g.n_expert, rcnt, (size_t) ne * 4, cudaMemcpyDeviceToHost, st));
-            if (mql || lhy(li)) {
+            if (lhy(li) && !g_layer) CK(cudaMemcpyAsync(h_cnt + li * g.n_expert, rcnt, (size_t) ne * 4, cudaMemcpyDeviceToHost, st));
+            if ((mql || lhy(li)) && !g_layer) {
                 CK(cudaStreamSynchronize(st));
                 if (lhy(li))
                     for (int x = 0; x < ne; ++x) hy[li].score[(size_t) x] += h_cnt[li * g.n_expert + x];
@@ -2354,19 +2492,20 @@ struct Engine {
             // zero-copy: an i8 layer reads its routed experts straight from the mapped host arena (no staging copy);
             // routed-only streaming: copy just the routed experts into compact staging. The stream position stays in
             // step for the fused/MMQ layers either way.
-            const bool zc_i8 = zc_arena && i8_on[li] && lhy(li);
-            const bool rs_i8 = route_stream && i8_on[li] && lhy(li) && !zc_i8;
-            const uint8_t* wbase = zc_i8 ? L.hblobs : (rs_i8 ? stream_take_routed(L, (int) li, T)
-                                                           : (lhy(li) ? stream_take((int) li) : L.blobs));
+            const bool zc_i8 = zc_arena && i8_on[li] && lhy(li) && !route_gather;
+            const bool rs_i8 = route_stream && !route_gather && i8_on[li] && lhy(li) && !zc_i8;
+            const uint8_t* wbase = g_layer ? gather_take((int) li)
+                                           : (zc_i8 ? L.hblobs : (rs_i8 ? stream_take_routed(L, (int) li, T)
+                                                                      : (lhy(li) ? stream_take((int) li) : L.blobs)));
             // a chunk that routes more experts than the compact buffer holds: no staging copy is possible; the
             // layer's entries go to the CPU pool straight from host memory (correct, slower) instead
-            const bool rs_cpu = rs_i8 && *h_routed > route_cap;
+            const bool rs_cpu = g_layer ? (wbase == nullptr) : (rs_i8 && *h_routed > route_cap);
             if (rs_cpu) {
                 CK(cudaMemsetAsync(eparts, 0, (size_t) n_ent * N * 4, st));
                 CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
                 CK(cudaMemcpyAsync(h_h, h, (size_t) T * N * 4, cudaMemcpyDeviceToHost, st));
                 CK(cudaEventRecord(ev_route, st));
-                moe_hybrid_cpu(li, T);
+                moe_hybrid_cpu(li, T, true);
             } else if (fz) {
                 // the layer's input to int8 once per token, the rows of each expert grouped on the device (no host wait),
                 // then per batch of experts gate/up + SwiGLU + H to int8 + down into the entries' rows (f_slot)
@@ -2385,7 +2524,7 @@ struct Engine {
                 // our int8 expert kernels: the layer's rows quantized once, the groups per expert (blobs from wbase: the streamed ring in the hybrid mode), gate/up + SwiGLU + H to int8 and
                 // the down rows into eparts by entry (prow stays null, as the grouped kernels).  A chunk whose experts average few rows takes the grouped kernels (the few-rows route).
                 group_entries(L, nullptr, T, wbase);
-                if (rs_i8 && *h_routed <= route_cap) {   // compact staging: group g's expert is at slot g, not expert*g
+                if ((rs_i8 && *h_routed <= route_cap) || (g_layer && wbase != nullptr)) {   // compact staging: group g's expert is at slot g, not expert*g
                     int32_t ng_h = 0;
                     CK(cudaMemcpyAsync(&ng_h, n_groups, 4, cudaMemcpyDeviceToHost, st));
                     CK(cudaStreamSynchronize(st));
@@ -2414,7 +2553,8 @@ struct Engine {
                 mctx->run(dn, st);
                 prow = rinv;
             }
-            if (lhy(li)) stream_done();
+            if (g_layer) gather_done((int) li);
+            else if (lhy(li)) stream_done();
         } else {
             group_entries(L, nullptr, T);
             if (!xq_post) quant(h, N, T, xq);   // the experts' and the shared expert's input
@@ -2452,7 +2592,8 @@ struct Engine {
             std::vector<int> seq;
             for (size_t l = 0; l < m->layers.size(); ++l)
                 if (lhy(l)) seq.push_back((int) l);
-            stream_begin(seq);
+            if (route_gather) gather_begin(seq);
+            else stream_begin(seq);
         }
         K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok, T, N, x, st);
         if (map_on) k_put_rows<<<T, kThreads, 0, st>>>(x, d_img, d_map, N);   // a picture's cells take its rows
@@ -2504,7 +2645,10 @@ struct Engine {
     void forward_mtp(int T, int64_t p0, const float* seeds, bool draft, bool graph_mode) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
-        if (main_hybrid && lhy(m->layers.size()) && T > hybrid_t && use_pf && !cpu_prompt) stream_begin({(int) m->layers.size()});
+        if (main_hybrid && lhy(m->layers.size()) && T > hybrid_t && use_pf && !cpu_prompt) {
+            if (route_gather) gather_begin({(int) m->layers.size()});
+            else stream_begin({(int) m->layers.size()});
+        }
         K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok_m, T, N, y, st);
         if (map_on) k_put_rows<<<T, kThreads, 0, st>>>(y, d_img, d_map, N);
         k_rms_ld<<<T, kThreads, 0, st>>>(y, N, m->mtp_enorm, mtp_cat, 2 * N, N, m->eps);              // [e | ...]
@@ -2532,6 +2676,68 @@ struct Engine {
     // ---- the hybrid mode
     const Layer& layer_at(int li) const { return li < (int) m->layers.size() ? m->layers[(size_t) li] : m->mtp; }
 
+    /// Routed-gather forward: each layer's routed experts are gathered from the host-mapped arena by one kernel into
+    /// the compact buffer pair. Layer l+1's gather is kicked when layer l's MoE starts, so the PCIe reads run under
+    /// layer l's expert compute + shared expert + combine. The router runs early (right after the mixer's post-norm)
+    /// so the next layer's routes are known while the current layer still computes.
+    void gather_begin(const std::vector<int>& seq) {
+        g_seq = seq;
+        g_pos = 0;
+        g_pend = -1;
+    }
+    /// The router + top-k + route list of layer li, run early (its h is ready after add_rms_post) so the NEXT layer's
+    /// gather can start under this layer's MoE. Per-layer list/count scratch: the in-flight gather reads its own.
+    void gather_route(const Layer& L, size_t li, int T) {
+        const auto& g = m->g;
+        const int N = (int) g.n_embd, Kp = (int) m->top_k, ne = (int) g.n_expert;
+        const int64_t n_ent = (int64_t) T * Kp;
+        f32mm(L.router, h, logits_r, N, ne, T);
+        K::native_router_topk(logits_r, ids, ewts, ne, Kp, T, st);
+        CK(cudaMemsetAsync(g_cnt + li * ne, 0, (size_t) ne * 4, st));
+        k_route_count<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, g_cnt + li * ne);
+        k_routed_list<<<1, 32, 0, st>>>(g_cnt + li * ne, ne, g_list + li * ne, g_nr + li, rpos);
+        CK(cudaMemcpyAsync(g_nr_h + li, g_nr + li, 4, cudaMemcpyDeviceToHost, st));
+        // the slot scores follow the same counts as the streamed path
+        CK(cudaMemcpyAsync(h_cnt + li * g.n_expert, g_cnt + li * ne, (size_t) ne * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
+        for (int x = 0; x < ne; ++x) hy[li].score[(size_t) x] += h_cnt[li * g.n_expert + x];
+    }
+    /// Kick the gather of g_seq[g_pos] into buffer g_pos % 2 on the copy stream (after the buffer's last reader).
+    void gather_kick_next() {
+        if (g_pos >= (int) g_seq.size()) return;
+        const int li = g_seq[(size_t) g_pos];
+        const int b = g_pos % 2;
+        const Layer& L = layer_at(li);
+        const int ne = (int) m->g.n_expert;
+        const int nr = g_nr_h[li];
+        if (nr > route_cap) {   // over capacity: no gather; the layer's MoE takes the CPU pool
+            g_pend = li;
+            ++g_pos;
+            return;
+        }
+        CK(cudaStreamWaitEvent(cst, ev_gused[b], 0));
+        k_gather_routed<<<nr, kThreads, 0, cst>>>(L.hblobs, L.stride, g_list + (size_t) li * ne, nr, L.L.bytes, stage[b]);
+        CK(cudaEventRecord(ev_gather[b], cst));
+        g_pend = li;
+        ++g_pos;
+    }
+    /// The MoE of layer li: wait for its gather (if any), return the compact buffer (null: over capacity -> CPU pool).
+    const uint8_t* gather_take(int li) {
+        if (g_pend != li) {
+            std::fprintf(stderr, "strata-q36: the expert gather is out of step (layer %d, pending %d)\n", li, g_pend);
+            std::exit(1);
+        }
+        if (g_nr_h[li] > route_cap) return nullptr;
+        const int b = (g_pos - 1) % 2;
+        CK(cudaStreamWaitEvent(st, ev_gather[b], 0));
+        return stage[b];
+    }
+    /// After layer li's expert kernels: mark its buffer free (the next gather of that buffer waits on this event).
+    void gather_done(int li) {
+        const int b = (g_pos - 1) % 2;
+        CK(cudaEventRecord(ev_gused[b], st));
+        g_pend = -1;
+    }
     /// A streamed forward over the state indices `seq`: the first two layers' experts start copying now.
     void stream_begin(const std::vector<int>& seq) {
         stream_seq = seq;
@@ -2636,7 +2842,7 @@ struct Engine {
     }
     /// The CPU half: the entries without a slot on the pool (ggml-cpu's arithmetic for the layer's formats), their
     /// rows uploaded and merged into the entries' rows.
-    void moe_hybrid_cpu(size_t li, int T) {
+    void moe_hybrid_cpu(size_t li, int T, bool force_all = false) {
 #if defined(STRATA_Q36_CPU_POOL)
         namespace C = strata::kernels::cpu;
         const auto& g = m->g;
@@ -2660,7 +2866,7 @@ struct Engine {
         for (int e = 0; e < n_ent; ++e) {
             const int x = h_ids[e];
             if (!defer) H.score[(size_t) x] += 1.0;
-            h_miss[e] = H.slot_of[(size_t) x] < 0;
+            h_miss[e] = force_all || H.slot_of[(size_t) x] < 0;
             if (!h_miss[e]) continue;
             ++n_miss;
             const int t = e / Kp;
@@ -3326,7 +3532,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     hin.n_layers = all.size();
     hin.tail = kMmqTail;
     hin.outputs = (size_t) E.tmax * (size_t) m.top_k * (size_t) g.n_embd * 4 + (size_t) E.tmax * (size_t) m.top_k * 4;
-    hin.staging_full = E.cpu_prompt ? 0 : 2 * ((E.route_stream ? route_layer : max_layer) + kMmqTail);
+    hin.staging_full = E.cpu_prompt ? 0 : 2 * ((E.route_stream ? route_layer : max_layer) + (E.route_gather ? 0 : kMmqTail));
     hin.streamed = E.use_pf && E.main_hybrid && !E.cpu_prompt;   // CPU prompt reads host memory directly: no staging pair
     hin.allow_drop = std::getenv("STRATA_Q36_KEEP_STAGING") == nullptr;   // =1: the old plan, no fallback
     hin.ne = ne;
@@ -3359,7 +3565,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     // STRATA_Q36_ZEROCOPY=1: the expert arena mapped into the GPU's address space (cudaHostAllocMapped). The i8
     // prompt path then reads only the routed experts' weights straight from host memory over PCIe — no whole-layer
     // staging copy (a 4 GB card streams ~270 MB/layer but routes only ~60 of 256 experts). Opt-in; default unchanged.
-    const bool zc = std::getenv("STRATA_Q36_ZEROCOPY") != nullptr && std::getenv("STRATA_Q36_ZEROCOPY")[0] != '0';
+    // gather mode needs the arena mapped too (its kernel reads the routed experts over PCIe); STRATA_Q36_ZEROCOPY=1
+    // additionally lets the i8 prompt read the arena directly without any staging copy
+    const bool zc_env = std::getenv("STRATA_Q36_ZEROCOPY") != nullptr && std::getenv("STRATA_Q36_ZEROCOPY")[0] != '0';
+    const bool zc = zc_env || E.route_gather;
     bool pinned = cudaHostAlloc((void**) &arena, host, zc ? cudaHostAllocMapped : cudaHostAllocDefault) == cudaSuccess;
     if (!pinned) {
         (void) cudaGetLastError();
@@ -3369,7 +3578,12 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             return false;
         }
     }
-    E.zc_arena = pinned && zc;
+    E.zc_arena = pinned && zc_env;   // the direct-read path only on explicit request; gather keeps its compact buffers
+    if (E.route_gather && !pinned) {
+        err = "routed-gather needs a pinned host-mapped expert arena and cudaHostAlloc failed (" +
+              std::to_string(host >> 20) + " MiB)";
+        return false;
+    }
     if (E.zc_arena) std::fprintf(stderr, "strata-q36: zero-copy expert arena (STRATA_Q36_ZEROCOPY): the i8 prompt reads routed experts from host memory\n");
     size_t off = 0;
     const size_t T = (size_t) E.tmax, N = (size_t) g.n_embd, Kp = (size_t) m.top_k;
@@ -3442,7 +3656,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     if (staging) {
         CK(cudaStreamCreateWithFlags(&E.cst, cudaStreamNonBlocking));
         for (int b = 0; b < 2; ++b) {
-            const size_t stage_bytes = (E.route_stream ? route_layer : max_layer) + kMmqTail;
+            const size_t stage_bytes = (E.route_stream ? route_layer : max_layer) + (E.route_gather ? 0 : kMmqTail);
             if (!alloc_vram((void**) &E.stage[b], stage_bytes,
                             b == 0 ? "prompt staging (E.stage[0])" : "prompt staging (E.stage[1])")) return false;
             CK(cudaMemset(E.stage[b], 0, stage_bytes));
@@ -3450,12 +3664,25 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             CK(cudaEventCreateWithFlags(&E.ev_used[b], cudaEventDisableTiming));
             CK(cudaEventRecord(E.ev_used[b], E.st));
         }
+        if (E.route_gather) {   // the gather pair's own events (the stream pair's stay for a mixed forward)
+            for (int b = 0; b < 2; ++b) {
+                CK(cudaEventCreateWithFlags(&E.ev_gather[b], cudaEventDisableTiming));
+                CK(cudaEventCreateWithFlags(&E.ev_gused[b], cudaEventDisableTiming));
+                CK(cudaEventRecord(E.ev_gused[b], E.st));
+            }
+        }
     }
     if (E.route_stream) {   // routed-expert list / count / position scratch + the pinned count readback
         E.rlist = dalloc_t<int32_t>((size_t) ne);
         E.rpos = dalloc_t<int32_t>((size_t) ne);
         E.rn_routed = dalloc_t<int32_t>(1);
         CK(cudaHostAlloc((void**) &E.h_routed, sizeof(int32_t), cudaHostAllocDefault));
+    }
+    if (E.route_gather) {   // per-layer route counts / lists / counts + the pinned mirror (the in-flight gather reads its own)
+        E.g_cnt = dalloc_t<int32_t>(all.size() * (size_t) ne);
+        E.g_list = dalloc_t<int32_t>(all.size() * (size_t) ne);
+        E.g_nr = dalloc_t<int32_t>(all.size());
+        CK(cudaHostAlloc((void**) &E.g_nr_h, all.size() * sizeof(int32_t), cudaHostAllocDefault));
     }
     E.pool = std::make_unique<C::ExpertPool>(threads);
     CK(cudaDeviceSynchronize());
