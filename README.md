@@ -33,6 +33,11 @@ Storage-only quantization of the attention K/V cache, following the Flash-Next
 prefill); the attention math itself stays full precision. Single-session
 (`--batch 1`). Per-token KV cost drops from 44 KiB (fp32) to ~11.3 KiB.
 
+### 3. Opt-in small prompt-scores buffer — `STRATA_Q36_SMALL_ATT=1`
+The prompt attention scores buffer at 64 MB instead of 256 MB from init (the size
+`shrink_att()` already uses when experts nearly fit). Long prompts take more,
+smaller slices; frees ~192 MB of VRAM for the KV cache on small cards.
+
 ## Measured on GTX 1650 4 GB
 
 Qwen3.6-35B-A3B UD-IQ3_XXS (13.2 GB pack), experts on CPU, dense weights on GPU:
@@ -41,7 +46,7 @@ Qwen3.6-35B-A3B UD-IQ3_XXS (13.2 GB pack), experts on CPU, dense weights on GPU:
 |---|---|---|
 | pack loads | refused (format gates) | yes, plain + MTP |
 | decode | — | ~30.7 tok/s |
-| max context | 7,168 (fp32 KV) | **23,552** (int8 KV); 16,384 used daily |
+| max context | 7,168 (fp32 KV) | **32,768** (int8 KV + small scores buffer, desktop on the iGPU) |
 | long-context quality | — | needle retrieval correct at 10,941 tokens |
 
 Honest limits on this hardware:
@@ -69,9 +74,9 @@ Tested with CUDA 13.4 / gcc 16 on Arch Linux. Other cards: set
 ## Run
 
 ```sh
-# int8 KV: ~3x context on a 4 GB card
-STRATA_Q36_KV_Q8=1 ./build-sm75/strata --serve \
-  --model Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf --max-context 16384 --batch 1 --chunk 512
+# int8 KV + small scores buffer: 32K context on a 4 GB card (desktop on the iGPU)
+STRATA_Q36_KV_Q8=1 STRATA_Q36_SMALL_ATT=1 ./build-sm75/strata --serve \
+  --model Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf --max-context 32768 --batch 1 --chunk 512
 
 # without the flag: upstream behavior, fp32 KV (7168 tokens fit on this card)
 ./build-sm75/strata --serve \
