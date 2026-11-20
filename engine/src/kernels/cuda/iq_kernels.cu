@@ -6577,6 +6577,8 @@ void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp
     }
     check("native_expert_i8/gu");
     if (L.d_type == 20) i8_launch<20, false>(tm, a, s);
+    else if (L.d_type == 18) i8_launch<18, false>(tm, a, s);
+    else if (L.d_type == 23) i8_launch<23, false>(tm, a, s);
     else if (L.d_type == 6) i8_launch<6, false>(tm, a, s);
     else if (L.d_type == 8) i8_launch<8, false>(tm, a, s);
     else if (L.d_type == 7) i8_launch<7, false>(tm, a, s);

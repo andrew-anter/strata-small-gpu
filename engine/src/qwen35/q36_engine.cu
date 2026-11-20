@@ -571,6 +571,25 @@ __global__ void k_route_scan(const int32_t* cnt, int n_expert, int32_t* bounds, 
     bounds[n_expert] = pos;
     *max_rows = mx;
 }
+// Routed-only streaming (STRATA_Q36_ROUTE_STREAM): the compact list of experts a chunk routes to. k_routed_list
+// reads the route counts (rcnt) and writes the routed expert ids in ascending order + their count; k_remap_groups
+// then points each group's blob at the expert's compact staging slot (routed_pos) instead of its full-layer offset.
+__global__ void k_routed_list(const int32_t* cnt, int n_expert, int32_t* list, int32_t* n_routed, int32_t* pos) {
+    if (threadIdx.x != 0) return;
+    int k = 0;
+    for (int x = 0; x < n_expert; ++x) {
+        if (cnt[x] > 0) { pos[x] = k; list[k++] = x; }
+        else pos[x] = -1;
+    }
+    *n_routed = k;
+}
+__global__ void k_remap_groups(unsigned long long* grp_ptr, int32_t n_groups, const uint8_t* stage, unsigned long long stride) {
+    // k_group emits groups in ascending expert id, and k_routed_list compacts in the same order: group g's expert
+    // sits at compact staging slot g. Point each group's blob there (the i8 kernels read only grp_ptr).
+    const int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= n_groups) return;
+    grp_ptr[g] = (unsigned long long) (stage + (size_t) g * stride);
+}
 __global__ void k_route_scatter(const int32_t* ids, int n_ent, int K_, int32_t* cur, int32_t* dst, int32_t* src,
                                 int32_t* inv) {
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1358,6 +1377,14 @@ struct Engine {
     std::vector<Hy> hy;
     int hybrid_t = 32;
     bool main_hybrid = false;   // some main layer is hybrid (else only the MTP block is: the decode graph stays)
+    bool zc_arena = false;      // STRATA_Q36_ZEROCOPY: the expert arena is host-mapped; the i8 prompt reads it directly
+    bool cpu_prompt = false;    // STRATA_Q36_CPU_PROMPT: prompt chunks' routed experts on the CPU pool (no PCIe weight stream)
+    bool route_stream = false;  // STRATA_Q36_ROUTE_STREAM: stream only the routed experts (compact staging), not the whole layer
+    int route_cap = 0;          // compact staging capacity in experts (per buffer)
+    int32_t *rlist = nullptr, *rn_routed = nullptr, *rpos = nullptr;   // routed-expert list / count / expert->slot
+    int32_t* h_routed = nullptr;   // pinned: the routed count read back per layer
+    const int32_t* stream_ids = nullptr;   // routed-only streaming: the chunk's routed ids (device), set at forward start
+    int stream_nent = 0;
     // #5012: the expert placement, for the INFO line (the Monitor's "expert cache: slots / experts"; strata/qwen35/expert_info.hpp)
     strata::qwen35::ExpertInfo expert_info;
     bool mtp_graph = true;      // the MTP draft step may be a graph (not when its layer is hybrid)
@@ -1483,6 +1510,14 @@ struct Engine {
             std::exit(1);
         }
         if (kv_q8) std::fprintf(stderr, "strata-q36: int8 KV cache on (STRATA_Q36_KV_Q8): ~4x less context VRAM\n");
+        cpu_prompt = std::getenv("STRATA_Q36_CPU_PROMPT") != nullptr && std::getenv("STRATA_Q36_CPU_PROMPT")[0] != '0';
+        if (cpu_prompt) std::fprintf(stderr, "strata-q36: CPU prompt experts on (STRATA_Q36_CPU_PROMPT): routed experts on the CPU pool, no weight stream\n");
+        route_stream = std::getenv("STRATA_Q36_ROUTE_STREAM") != nullptr && std::getenv("STRATA_Q36_ROUTE_STREAM")[0] != '0';
+        if (route_stream) std::fprintf(stderr, "strata-q36: routed-only expert streaming on (STRATA_Q36_ROUTE_STREAM): compact staging, ~4x less PCIe\n");
+        if (route_stream && cpu_prompt) {   // the two prompt paths are exclusive: routed streaming wins
+            cpu_prompt = false;
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_CPU_PROMPT ignored while routed-only streaming is on\n");
+        }
         tmax = std::max(tmax_, kVerify);
         const auto& g = m->g;
         const size_t T = (size_t) tmax, N = (size_t) g.n_embd, Kp = (size_t) m->top_k, FF = (size_t) g.n_ff;
@@ -1547,6 +1582,11 @@ struct Engine {
             const Layer& Li = layer_at((int) i);
             const bool mmq_takes = !fused_on[i] && mmq_avail && mmq_ok(Li);
             const K::Q36Route r = K::q36_layer_route(fused_on[i] != 0, i8_raw, mmq_free, mmq_takes, !fused_on[i] && K::native_expert_i8_supported(Li.L));
+            if (std::getenv("STRATA_Q36_ROUTE_DEBUG") && (i < 2 || r == K::Q36Route::Grouped))
+                std::fprintf(stderr, "strata-q36 ROUTE[%zu]: gu=%d d=%d fused=%d i8_raw=%d mmq_free=%d mmq_takes=%d i8_sup=%d -> %d (embd=%lld ff=%lld nib=%d tail=%zu had=%d)\n",
+                             i, Li.L.gu_type, Li.L.d_type, (int)fused_on[i], i8_raw, (int)mmq_free, (int)mmq_takes,
+                             (int)K::native_expert_i8_supported(Li.L), (int)r, (long long)Li.L.n_embd, (long long)Li.L.n_ff,
+                             (int)Li.L.gu_nib, Li.L.tail_off, Li.L.had_block);
             const bool mq = r == K::Q36Route::Mmq;
             i8_on[i] = r == K::Q36Route::Int8 ? 1 : 0;
             if (r == K::Q36Route::Grouped) ++n_grouped;
@@ -1690,18 +1730,27 @@ struct Engine {
                 const size_t shared_tok = (size_t) g.n_head_kv * g.head_dim * 2 * 2;   // the fp16 K / V copy (k16 / v16 above)
                 const size_t kv_tok = kv_tok_layer * n_attn;
                 const size_t ne = (size_t) g.n_expert;
-                size_t total_main = 0, max_layer = 0, packed = 0;
+                size_t total_main = 0, max_layer = 0, max_stride = 0, packed = 0;
                 for (const Layer& L : m->layers) {
                     total_main += L.stride * ne + kMmqTail;
                     max_layer = std::max(max_layer, L.stride * ne);
+                    max_stride = std::max(max_stride, L.stride);
                 }
-                if (m->has_mtp) max_layer = std::max(max_layer, m->mtp.stride * ne);
+                if (m->has_mtp) {
+                    max_layer = std::max(max_layer, m->mtp.stride * ne);
+                    max_stride = std::max(max_stride, m->mtp.stride);
+                }
                 for (const auto& pk : m->packed) packed += std::get<2>(pk);
+                // routed-only streaming stages only the chunk's routed experts (the same cap place_experts uses)
+                int fit_route_cap = 192;
+                if (const char* rc = std::getenv("STRATA_Q36_ROUTE_CAP")) fit_route_cap = std::max(16, std::min((int) ne, std::atoi(rc)));
+                fit_route_cap = (int) std::min<int64_t>((int64_t) ne, (int64_t) fit_route_cap);
+                const size_t fit_staging = route_stream ? max_stride * (size_t) fit_route_cap : max_layer;
                 const strata::qwen35::OneSessionFit f = strata::qwen35::one_session_fit(
                     {(size_t) ctx, kv_tok, shared_tok, per - kv_tok * (size_t) ctx, fr0, total_main, packed,
                      kAttScoreFloats > ((size_t) 16 << 20) ? (kAttScoreFloats - ((size_t) 16 << 20)) * 6 : 0,
                      strata::qwen35::one_session_staging_counted(use_mmq, n_i8 > 0, use_pf, MMQ::built())
-                         ? 2 * (max_layer + kMmqTail) : 0, T * Kp * N * 4 + T * Kp * 4});
+                         ? 2 * (fit_staging + kMmqTail) : 0, T * Kp * N * 4 + T * Kp * 4});
                 if (f.refuse) {   // the old ending: the bare cudaMalloc line in alloc_session, or the hybrid buffers' text in place_experts
                     std::fprintf(stderr, "strata-q36: %s\n", strata::qwen35::one_session_fit_line(ctx, f).c_str());
                     std::exit(1);
@@ -2263,6 +2312,18 @@ struct Engine {
         const int32_t* prow = nullptr;
         if (hy_rows) {
             moe_hybrid_gpu(L, li, T);
+        } else if (cpu_prompt && lhy(li) && T > kGemmT) {
+            // CPU prompt: the chunk's routed experts on the CPU pool straight from host memory (RAM bandwidth,
+            // no PCIe weight stream, no staging). The GPU keeps attention / dense / shared expert; eparts zeroed,
+            // the pool's rows merged over it. No stream_take/done: the CPU path has no staging buffers.
+            CK(cudaMemsetAsync(eparts, 0, (size_t) n_ent * N * 4, st));
+            // upload ids/h only (no GPU grouped pass: with 0 slots it would be fully overwritten by the pool's rows)
+            CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
+            CK(cudaMemcpyAsync(h_h, h, (size_t) T * N * 4, cudaMemcpyDeviceToHost, st));
+            CK(cudaEventRecord(ev_route, st));
+            moe_hybrid_cpu(li, T);
+            if (std::getenv("STRATA_Q36_ROUTE_DEBUG") && li == 0)
+                std::fprintf(stderr, "strata-q36 CPU-PROMPT layer 0: T=%d n_ent=%lld hy_cpu=%lld hy_cpu_ms=%.0f\n", T, (long long)n_ent, hy_cpu, hy_cpu_ms);
         } else if (T > kGemmT && use_pf) {
             // a prompt chunk: each expert's weights read once for all its rows, on Strata's fused int8 kernels where they
             // cover the layer (fused_on), else on llama.cpp's MMQ.  In the hybrid mode the layer's experts come streamed
@@ -2290,8 +2351,23 @@ struct Engine {
                     for (int x = 0; x < ne; ++x) hy[li].score[(size_t) x] += h_cnt[li * g.n_expert + x];
                 maxr = hpin[10];
             }
-            const uint8_t* wbase = lhy(li) ? stream_take((int) li) : L.blobs;
-            if (fz) {
+            // zero-copy: an i8 layer reads its routed experts straight from the mapped host arena (no staging copy);
+            // routed-only streaming: copy just the routed experts into compact staging. The stream position stays in
+            // step for the fused/MMQ layers either way.
+            const bool zc_i8 = zc_arena && i8_on[li] && lhy(li);
+            const bool rs_i8 = route_stream && i8_on[li] && lhy(li) && !zc_i8;
+            const uint8_t* wbase = zc_i8 ? L.hblobs : (rs_i8 ? stream_take_routed(L, (int) li, T)
+                                                           : (lhy(li) ? stream_take((int) li) : L.blobs));
+            // a chunk that routes more experts than the compact buffer holds: no staging copy is possible; the
+            // layer's entries go to the CPU pool straight from host memory (correct, slower) instead
+            const bool rs_cpu = rs_i8 && *h_routed > route_cap;
+            if (rs_cpu) {
+                CK(cudaMemsetAsync(eparts, 0, (size_t) n_ent * N * 4, st));
+                CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
+                CK(cudaMemcpyAsync(h_h, h, (size_t) T * N * 4, cudaMemcpyDeviceToHost, st));
+                CK(cudaEventRecord(ev_route, st));
+                moe_hybrid_cpu(li, T);
+            } else if (fz) {
                 // the layer's input to int8 once per token, the rows of each expert grouped on the device (no host wait),
                 // then per batch of experts gate/up + SwiGLU + H to int8 + down into the entries' rows (f_slot)
                 FQ::quantize_act_native(h, T, N, f_xq, st);
@@ -2309,6 +2385,12 @@ struct Engine {
                 // our int8 expert kernels: the layer's rows quantized once, the groups per expert (blobs from wbase: the streamed ring in the hybrid mode), gate/up + SwiGLU + H to int8 and
                 // the down rows into eparts by entry (prow stays null, as the grouped kernels).  A chunk whose experts average few rows takes the grouped kernels (the few-rows route).
                 group_entries(L, nullptr, T, wbase);
+                if (rs_i8 && *h_routed <= route_cap) {   // compact staging: group g's expert is at slot g, not expert*g
+                    int32_t ng_h = 0;
+                    CK(cudaMemcpyAsync(&ng_h, n_groups, 4, cudaMemcpyDeviceToHost, st));
+                    CK(cudaStreamSynchronize(st));
+                    k_remap_groups<<<grid1(ng_h), kThreads, 0, st>>>(grp_ptr, ng_h, wbase, L.stride);
+                }
                 if (K::q36_i8_chunk_takes(n_ent, ne, i8_few)) {
                     K::native_expert_i8_quantize(h, T, N, i8x, st);
                     K::native_expert_i8(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, std::min<int64_t>(n_ent, g.n_expert), n_ent, i8x, escr, eparts, st);
@@ -2366,7 +2448,7 @@ struct Engine {
     void forward(int T, int64_t p0, int heads, bool graph_mode, bool verify) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
-        if (main_hybrid && T > hybrid_t && use_pf) {
+        if (main_hybrid && T > hybrid_t && use_pf && !cpu_prompt) {
             std::vector<int> seq;
             for (size_t l = 0; l < m->layers.size(); ++l)
                 if (lhy(l)) seq.push_back((int) l);
@@ -2422,7 +2504,7 @@ struct Engine {
     void forward_mtp(int T, int64_t p0, const float* seeds, bool draft, bool graph_mode) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
-        if (main_hybrid && lhy(m->layers.size()) && T > hybrid_t && use_pf) stream_begin({(int) m->layers.size()});
+        if (main_hybrid && lhy(m->layers.size()) && T > hybrid_t && use_pf && !cpu_prompt) stream_begin({(int) m->layers.size()});
         K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok_m, T, N, y, st);
         if (map_on) k_put_rows<<<T, kThreads, 0, st>>>(y, d_img, d_map, N);
         k_rms_ld<<<T, kThreads, 0, st>>>(y, N, m->mtp_enorm, mtp_cat, 2 * N, N, m->eps);              // [e | ...]
@@ -2459,6 +2541,13 @@ struct Engine {
     void stream_kick(int i) {   // the i-th layer of the sequence into staging buffer i % 2, after its last reader
         const int b = i % 2;
         const Layer& L = layer_at(stream_seq[(size_t) i]);
+        // zero-copy / routed-only / CPU-prompt i8 layers: no whole-layer prefetch (the compact buffer can't hold a
+        // full layer); the copy happens in stream_take_routed / the mapped arena / the CPU pool. Keep the event chain.
+        if ((zc_arena && i8_on[(size_t) stream_seq[(size_t) i]]) || cpu_prompt ||
+            (route_stream && i8_on[(size_t) stream_seq[(size_t) i]])) {
+            CK(cudaEventRecord(ev_copy[b], cst));
+            return;
+        }
         CK(cudaStreamWaitEvent(cst, ev_used[b], 0));
         // the experts with a VRAM slot come from it (device to device, at VRAM speed), only the others over PCIe; runs
         // of consecutive experts from the same source in one copy each.  STRATA_Q36_STREAM_ALL=1: the whole layer from
@@ -2504,6 +2593,32 @@ struct Engine {
         CK(cudaEventRecord(ev_used[b], st));
         if (stream_pos + 2 < (int) stream_seq.size()) stream_kick(stream_pos + 2);
         ++stream_pos;
+    }
+    /// Routed-only streaming for one i8 layer: count the chunk's routes, build the compact routed-expert list, copy
+    /// just those experts from the host arena into the staging buffer (slot g = group g), and return the buffer.
+    /// Falls back to the whole-layer copy if the chunk routes more experts than the compact capacity.
+    const uint8_t* stream_take_routed(const Layer& L, int li, int T) {
+        const int ne = (int) m->g.n_expert;
+        const int b = stream_pos % 2;
+        const int64_t n_ent = (int64_t) T * m->top_k;
+        CK(cudaMemsetAsync(rcnt, 0, (size_t) ne * 4, st));
+        k_route_count<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, rcnt);
+        k_routed_list<<<1, 32, 0, st>>>(rcnt, ne, rlist, rn_routed, rpos);
+        CK(cudaMemcpyAsync(h_routed, rn_routed, 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
+        const int nr = *h_routed;
+        if (nr > route_cap) {   // more routed experts than the compact buffer holds: the caller takes the CPU pool
+            return nullptr;     // (a whole-layer copy would overflow the compact staging)
+        }
+        // copy each routed expert into its compact slot (ascending expert id == group order)
+        std::vector<int32_t> hl((size_t) ne);
+        CK(cudaMemcpyAsync(hl.data(), rlist, (size_t) nr * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
+        for (int k = 0; k < nr; ++k)
+            CK(cudaMemcpyAsync(stage[b] + (size_t) k * L.stride, L.hblobs + (size_t) hl[(size_t) k] * L.stride,
+                               L.stride, cudaMemcpyHostToDevice, st));
+        CK(cudaStreamSynchronize(st));
+        return stage[b];
     }
 
     /// The GPU half of a hybrid MoE: the routing to the host, the resident experts' entries grouped and run.
@@ -3107,6 +3222,16 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         per_slot += L->stride;
         max_layer = std::max(max_layer, L->stride * (size_t) ne);
     }
+    // routed-only streaming: the compact staging holds the chunk's routed experts, not the whole layer. A 512-token
+    // chunk (4096 entries over 256 experts) routes ~150 distinct experts; the cap defaults to 192 (headroom) and is
+    // tunable with STRATA_Q36_ROUTE_CAP. A chunk routing more than the cap falls back to the whole-layer copy.
+    size_t max_stride = 0;
+    for (Layer* L : all) max_stride = std::max(max_stride, L->stride);
+    int route_cap = 192;
+    if (const char* rc = std::getenv("STRATA_Q36_ROUTE_CAP")) route_cap = std::max(16, std::min((int) ne, std::atoi(rc)));
+    route_cap = (int) std::min<int64_t>((int64_t) ne, (int64_t) route_cap);
+    const size_t route_layer = max_stride * (size_t) route_cap;
+    if (E.route_stream) E.route_cap = route_cap;
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
     const size_t reserve = (size_t) 768 << 20;
@@ -3201,8 +3326,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     hin.n_layers = all.size();
     hin.tail = kMmqTail;
     hin.outputs = (size_t) E.tmax * (size_t) m.top_k * (size_t) g.n_embd * 4 + (size_t) E.tmax * (size_t) m.top_k * 4;
-    hin.staging_full = 2 * (max_layer + kMmqTail);
-    hin.streamed = E.use_pf && E.main_hybrid;
+    hin.staging_full = E.cpu_prompt ? 0 : 2 * ((E.route_stream ? route_layer : max_layer) + kMmqTail);
+    hin.streamed = E.use_pf && E.main_hybrid && !E.cpu_prompt;   // CPU prompt reads host memory directly: no staging pair
     hin.allow_drop = std::getenv("STRATA_Q36_KEEP_STAGING") == nullptr;   // =1: the old plan, no fallback
     hin.ne = ne;
     hin.slots_forced = slots;
@@ -3231,7 +3356,11 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     for (Layer* L : all)
         if (!mtp_only || L == &m.mtp) host += L->stride * (size_t) ne + kMmqTail;
     uint8_t* arena = nullptr;
-    bool pinned = cudaHostAlloc((void**) &arena, host, cudaHostAllocDefault) == cudaSuccess;
+    // STRATA_Q36_ZEROCOPY=1: the expert arena mapped into the GPU's address space (cudaHostAllocMapped). The i8
+    // prompt path then reads only the routed experts' weights straight from host memory over PCIe — no whole-layer
+    // staging copy (a 4 GB card streams ~270 MB/layer but routes only ~60 of 256 experts). Opt-in; default unchanged.
+    const bool zc = std::getenv("STRATA_Q36_ZEROCOPY") != nullptr && std::getenv("STRATA_Q36_ZEROCOPY")[0] != '0';
+    bool pinned = cudaHostAlloc((void**) &arena, host, zc ? cudaHostAllocMapped : cudaHostAllocDefault) == cudaSuccess;
     if (!pinned) {
         (void) cudaGetLastError();
         arena = (uint8_t*) std::malloc(host);
@@ -3240,6 +3369,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             return false;
         }
     }
+    E.zc_arena = pinned && zc;
+    if (E.zc_arena) std::fprintf(stderr, "strata-q36: zero-copy expert arena (STRATA_Q36_ZEROCOPY): the i8 prompt reads routed experts from host memory\n");
     size_t off = 0;
     const size_t T = (size_t) E.tmax, N = (size_t) g.n_embd, Kp = (size_t) m.top_k;
     auto alloc_vram = [&](void** p, size_t bytes, const char* what) -> bool {
@@ -3311,13 +3442,20 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     if (staging) {
         CK(cudaStreamCreateWithFlags(&E.cst, cudaStreamNonBlocking));
         for (int b = 0; b < 2; ++b) {
-            if (!alloc_vram((void**) &E.stage[b], max_layer + kMmqTail,
+            const size_t stage_bytes = (E.route_stream ? route_layer : max_layer) + kMmqTail;
+            if (!alloc_vram((void**) &E.stage[b], stage_bytes,
                             b == 0 ? "prompt staging (E.stage[0])" : "prompt staging (E.stage[1])")) return false;
-            CK(cudaMemset(E.stage[b], 0, max_layer + kMmqTail));
+            CK(cudaMemset(E.stage[b], 0, stage_bytes));
             CK(cudaEventCreateWithFlags(&E.ev_copy[b], cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&E.ev_used[b], cudaEventDisableTiming));
             CK(cudaEventRecord(E.ev_used[b], E.st));
         }
+    }
+    if (E.route_stream) {   // routed-expert list / count / position scratch + the pinned count readback
+        E.rlist = dalloc_t<int32_t>((size_t) ne);
+        E.rpos = dalloc_t<int32_t>((size_t) ne);
+        E.rn_routed = dalloc_t<int32_t>(1);
+        CK(cudaHostAlloc((void**) &E.h_routed, sizeof(int32_t), cudaHostAllocDefault));
     }
     E.pool = std::make_unique<C::ExpertPool>(threads);
     CK(cudaDeviceSynchronize());

@@ -38,6 +38,18 @@ The prompt attention scores buffer at 64 MB instead of 256 MB from init (the siz
 `shrink_att()` already uses when experts nearly fit). Long prompts take more,
 smaller slices; frees ~192 MB of VRAM for the KV cache on small cards.
 
+### 4. Opt-in routed-only expert streaming — `STRATA_Q36_ROUTE_STREAM=1`
+The streamed prompt path used to copy **every** expert of a layer into VRAM
+staging per chunk (256 experts × 40 layers ≈ 10.8 GB over PCIe for a 512-token
+chunk) although a chunk routes to only ~150 distinct experts. This flag counts
+the chunk's routes on the device (`k_route_count` / `k_routed_list`), copies just
+those experts into a compact staging pair, and remaps the grouped kernels' blob
+pointers (`k_remap_groups`) — ~4× less PCIe traffic and ~4× smaller staging.
+`STRATA_Q36_ROUTE_CAP` (default 192) sets the compact capacity in experts; a
+chunk routing more than the cap falls back to the CPU pool for that layer
+(correct, slower). The one-session context fit check accounts for the compact
+staging, so small cards get the right "tokens fit here" figure.
+
 ## Measured on GTX 1650 4 GB
 
 Qwen3.6-35B-A3B UD-IQ3_XXS (13.2 GB pack), experts on CPU, dense weights on GPU:
@@ -46,14 +58,17 @@ Qwen3.6-35B-A3B UD-IQ3_XXS (13.2 GB pack), experts on CPU, dense weights on GPU:
 |---|---|---|
 | pack loads | refused (format gates) | yes, plain + MTP |
 | decode | — | ~30.7 tok/s |
-| max context | 7,168 (fp32 KV) | **32,768** (int8 KV + small scores buffer, desktop on the iGPU) |
-| long-context quality | — | needle retrieval correct at 10,941 tokens |
+| max context | 7,168 (fp32 KV) | **32,768** (int8 KV + small scores buffer); **15,360 with fast prefill** (routed streaming staging must fit) |
+| prefill (1500-token prompt) | ~45 tok/s | **~78 tok/s** (routed streaming, 15,360 ctx) |
+| long-context quality | — | needle correct at 10,941 tokens; routed-streaming needle correct at 1,130 tokens via the OpenAI API |
 
 Honest limits on this hardware:
 
-- **Prefill is slow (~32–43 tok/s).** With ~no experts in VRAM, prompt experts run
-  per-token on the CPU; there is no room for the batched GPU kernels. A batched
-  CPU prefill path is the next target.
+- **Prefill without routed streaming stays slow (~45 tok/s):** the whole-layer
+  weight stream dominates. With `STRATA_Q36_ROUTE_STREAM=1` it reaches ~78 tok/s
+  while the compact staging fits (≤15,360 context on this card); beyond that the
+  engine falls back to the CPU pool path. The remaining cost is the per-expert
+  copy overhead and the CPU pool's decode-side work, not the expert math.
 - **MTP drafting gives no speedup on 4 GB** (CPU-bound experts; draft overhead
   cancels the gain) and costs ~2K context. The plain pack is the better deal here;
   MTP support matters on bigger cards.
@@ -74,6 +89,12 @@ Tested with CUDA 13.4 / gcc 16 on Arch Linux. Other cards: set
 ## Run
 
 ```sh
+# recommended on this card: int8 KV + small scores buffer + routed-only streaming
+# (15,360 context with ~78 tok/s prefill; cap 160 leaves staging headroom)
+STRATA_Q36_KV_Q8=1 STRATA_Q36_SMALL_ATT=1 STRATA_Q36_ROUTE_STREAM=1 STRATA_Q36_ROUTE_CAP=160 \
+  ./build-sm75/strata --serve \
+  --model Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf --max-context 15360 --batch 1 --chunk 512
+
 # int8 KV + small scores buffer: 32K context on a 4 GB card (desktop on the iGPU)
 STRATA_Q36_KV_Q8=1 STRATA_Q36_SMALL_ATT=1 ./build-sm75/strata --serve \
   --model Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf --max-context 32768 --batch 1 --chunk 512
